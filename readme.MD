@@ -1,139 +1,110 @@
 # DataMatrix Fixer
 
-Reads damaged, worn or hard-to-read **laser-marked DataMatrix codes** (ECC 200) by matching them against a list of known serial number candidates.
+Reads damaged, worn or hard-to-read **DataMatrix (ECC 200)** codes, including laser-marked ones, from one or many handheld photos.
 
-Instead of forcing a decoder to succeed on a bad image, the program turns the problem around:
+Two methods work together:
 
-1. Each image is perspective-corrected and rotated to the correct orientation.
-2. The module grid is sampled and every module gets a confidence value.
-3. Evidence from **multiple handheld images** is combined module by module.
-4. Every candidate serial number is encoded as a DataMatrix and compared to the combined evidence. The best match wins, but only if it is clearly better than the runner-up.
-
-This works well when the set of possible serial numbers is small (tens to a few hundred), and it tolerates missing or destroyed modules far better than a normal decoder.
+1. **Built-in decoder (no candidate list needed).** The image is perspective-corrected and rotated using the finder pattern. The module grid is sampled, the ECC 200 placement is applied, and Reed-Solomon error correction runs on the result. Modules the program is unsure about are treated as *erasures*, which lets it correct roughly twice as many damaged codewords as an ordinary decoder.
+2. **Generate-and-compare (optional).** If you supply a list of possible serial numbers, each one is encoded as a DataMatrix and compared with the evidence combined from all images. This still works when the code is too damaged for error correction.
 
 ## Features
 
-- Perspective correction and automatic orientation using the known finder pattern (solid "L") and clock track
-- Illumination-independent thresholding (threshold is measured from the finder/clock modules of each image)
-- Handles inverted contrast (light marks on dark background) automatically
-- Small grid-alignment search (sub-module offset and scale) to compensate for handheld shots
+- Symbol size by parameter (`--size 20`, `8x18`, `18,20,22`) or **automatic** (`--size auto`, default)
+- All standard ECC 200 sizes, square and rectangular, including multi-region symbols
+- Perspective correction with line-fitted corners (robust against missing corner modules and glow around bright marks)
+- Any rotation, inverted contrast (bright marks on dark background), uneven lighting
 - Multi-image fusion, weighted by image quality
-- Square and rectangular symbols (e.g. `18x18`, `8x18`, `16x48`), one or several sizes at once
-- All encoding schemes tried (ASCII, C40, Text, X12, EDIFACT, Base256)
-- Fast path: ordinary decoding with libdmtx / zxing-cpp is tried first
-- Confidence reporting: results are rejected as uncertain if the match is poor or the margin to the second-best candidate is small, so a wrong serial number does not slip through silently
+- Decodes ASCII, C40, Text, X12, EDIFACT and Base256 data
+- False-positive protection: reserved error-correction margin and plausibility check on the decoded text
+- Optional fast path through libdmtx / zxing-cpp
 
 ## Installation
 
 ```bash
-py -m pip install opencv-python numpy pylibdmtx zxing-cpp
+py -m pip install opencv-python numpy setuptools
+py -m pip install pylibdmtx zxing-cpp      # optional
 ```
 
-`zxing-cpp` is optional (used as a fallback decoder).
+`pylibdmtx` and `zxing-cpp` are optional. The built-in decoder works without them. `pylibdmtx` is only needed for the candidate comparison.
 
-### Windows notes
-
-- **`ModuleNotFoundError: No module named 'distutils'`** (Python 3.12+): `pylibdmtx` still imports `distutils`, which was removed from the standard library. Fix:
-  ```bash
-  py -m pip install setuptools
-  ```
-- **DLL load errors** when importing `pylibdmtx`: install the *Microsoft Visual C++ Redistributable (x64)*.
-- The package to install is `opencv-python`, not `cv2`.
-
-Verify the installation:
-
-```bash
-py -c "import cv2, numpy, pylibdmtx.pylibdmtx; print(cv2.__version__)"
-```
+Windows notes:
+- `No module named 'distutils'` (Python 3.12+): `py -m pip install setuptools`
+- DLL errors from `pylibdmtx`: install *Microsoft Visual C++ Redistributable (x64)*
+- The pip package is `opencv-python`, not `cv2`
 
 ## Usage
 
-### 1. Candidate list
-
-Create a text file with **one serial number per line**, e.g. `serials.txt`:
-
-```
-AB   123.456:78
-AB   123.457:78
-```
-
-Spaces are preserved exactly (only the line break is removed). `"AB   123"` and `"AB  123"` are different candidates, so make sure the number of spaces, and any trailing spaces, is correct.
-
-### 2. Run
-
 ```bash
-# All images in a folder -> one combined result
-py datamatrixFixer.py serials.txt --size 18 --images images/
+# Decode all images in a folder and combine them into one result, size detected automatically
+py datamatrixFixer.py --images images/
 
-# Each image processed separately
-py datamatrixFixer.py serials.txt --size 18 --images images/ --each
+# Known size
+py datamatrixFixer.py --size 20 --images images/
 
-# Several possible symbol sizes (best match wins)
-py datamatrixFixer.py serials.txt --size 16,18,20 --images images/
+# Each image separately
+py datamatrixFixer.py --size 20 --images images/ --each
 
-# Rectangular symbol
-py datamatrixFixer.py serials.txt --size 8x18 --images images/
+# With a candidate list (one serial per line, spaces preserved exactly)
+py datamatrixFixer.py serials.txt --size 18,20 --images images/
 
-# Live camera (r = reset accumulated evidence, q = quit)
-py datamatrixFixer.py serials.txt --size 18 --camera 0
+# Live camera (r = reset, q = quit)
+py datamatrixFixer.py --size 20 --camera 0
 ```
+
+Example output:
+
+```
+ser0001.png [20x20]: quality 7.77  own: 'PCBA;200043-C;DAR;2635;0001'
+
+=== Combined result ===
+Size 20x20 (1 images):
+  Own decoder: 'PCBA;200043-C;DAR;2635;0001'  (RS: 0 errors corrected, 0 codewords erased; PAD)
+RESULT: 'PCBA;200043-C;DAR;2635;0001'  [size 20x20, own decoder]
+```
+
+(The program's console messages are in Finnish.)
 
 ### Options
 
 | Option | Description |
 |---|---|
-| `--size` | Symbol size in modules: `18`, `16x16`, `8x18`, or a comma-separated list. Default `18`. |
-| `--images` | Folder or glob pattern (e.g. `images/*.jpg`). |
+| `serials` | Optional text file with candidate serial numbers, one per line. Do not trim spaces. |
+| `--size` | `20`, `16x16`, `8x18`, a list `18,20,22`, or `auto` (default). |
+| `--images` | Folder or glob (e.g. `images/*.png`). |
 | `--camera` | Camera index for live mode. |
-| `--each` | Treat every image independently instead of combining them. |
-| `--no-direct` | Skip the normal decoding fast path. |
-| `--scheme` | Restrict encoding schemes (repeatable), e.g. `--scheme Ascii`. Default: all. |
-| `--dp-min` | Minimum image quality (default `1.5`). Weaker images are discarded. |
-| `--max-err` | Maximum accepted mismatch of the best candidate (default `0.20`). |
-| `--min-margin` | Minimum gap to the second-best candidate (default `0.03`). |
+| `--each` | Process every image independently instead of combining them. |
+| `--no-direct` | Skip the libdmtx/zxing fast path. |
+| `--scheme` | Restrict candidate encoding schemes (repeatable), e.g. `--scheme Ascii`. |
+| `--dp-min` | Minimum image quality (default 1.5). Weaker images are ignored. |
+| `--max-err`, `--min-margin` | Acceptance thresholds for the candidate comparison. |
 
-### Output
+## How the result is judged
 
-```
-=== Combined result ===
-Size 18x18 (8 images):
-  0.041  'AB   123.456:78'  (Ascii)
-  0.212  'AB   123.457:78'  (Ascii)
-  -> 'AB   123.456:78'  OK: error 0.041, margin 0.171, scheme Ascii
-```
+- **Own decoder:** a result is accepted only if Reed-Solomon verification passes with spare correction capacity left over, and the decoded text looks sensible. If you supplied candidates, the output also says whether the decoded text is in the list.
+- **Candidate comparison:** the best candidate must have a low mismatch and a clear margin over the runner-up, otherwise it is reported as uncertain.
 
-- **error**: weighted fraction of mismatching modules (0 = perfect, ~0.5 = random)
-- **margin**: difference to the second-best candidate
-- A result is flagged as *uncertain* when the margin is too small, and as a poor match when the error is too high. Check those manually.
+## Tips
 
-## Tips for good results
+- Take several photos (5-15) from slightly different angles and lighting, and let the program combine them.
+- The code should be roughly 100 px or more across in the image. For a 3 mm code, shoot close-up or macro.
+- Lighting matters more than software. For laser marks, diffuse dome light or low-angle light helps a lot.
+- If you know the size, pass `--size`. It is faster and avoids rare misdetections.
+- When damage is so heavy that the built-in decoder fails, supply a candidate list.
 
-- **Take several images (5-15)** from slightly different angles and lighting. Reflections land in different places in each shot, and fusion removes them.
-- **Fill the frame**: the code should be at least roughly 100-150 px across. A 3 mm code needs close-up or macro shooting.
-- **Restrict the scheme** when you know it. Take one readable code from the same batch, see which scheme matches in the output, then use e.g. `--scheme Ascii`. This is faster and reduces false matches.
-- **Restrict the size**. Each additional size adds processing time and a small chance of a false match.
-- **Tune the thresholds** (`--max-err`, `--min-margin`, `--dp-min`) using ten or so known codes: see at which error correct matches arrive and how close wrong ones get.
-- **Lighting matters more than software.** For laser marks on metal, diffuse dome light or low-angle/dark-field lighting makes a big difference.
+## Verification status
+
+- Tested on a real 20x20 code: decoded correctly, including after synthetic rotation, perspective, uneven lighting, noise, blur, scratches and inversion.
+- Reed-Solomon correction tested with simulated damage (up to 7 wrong codewords, or 12-14 uncertain ones).
+- No false positives on 450 random-noise trials across all sizes.
+- Other symbol sizes use the ISO 16022 tables and the standard placement algorithm. The tables are internally consistent, but only 20x20 has been verified against a real code.
+- The candidate comparison (requires `pylibdmtx`) and live camera mode could not be tested in the development environment.
 
 ## Limitations
 
-- Developed and syntax-checked, but **not yet tuned on real-world image sets**. Thresholds will need adjusting to your images.
-- Code localization is contour-based. It can fail on cluttered backgrounds. Crop the image closer to the code if detection fails.
-- Dot-peen / dotted marks would benefit from a dilation step before sampling (not included by default).
-- Strong illumination gradients (shiny metal) would benefit from per-module local thresholding.
-- Candidates that do not fit the chosen symbol size are skipped (the program reports how many).
-
-## How it works (short version)
-
-| Step | What happens |
-|---|---|
-| Localize | Adaptive threshold + contours, both polarities, squareness filter |
-| Rectify | Perspective warp to a fixed grid (16 px per module) |
-| Align | Search over sub-module offsets and scale; 4 rotations; normal/inverted contrast; choose the best fit to the known finder + clock pattern |
-| Threshold | Dark/light levels measured from the finder and clock modules; each module becomes an evidence value in [-1, 1] |
-| Fuse | Quality-weighted average of evidence over all images |
-| Match | Candidates encoded with libdmtx in all schemes; weighted mismatch against the evidence; best candidate + margin |
+- Large confidently-wrong damage (e.g. an area blacked out) cannot be detected as erasures; use the candidate list there.
+- Code localization is contour-based and may fail on cluttered backgrounds. Crop closer if needed.
+- Dot-peen marks would benefit from a dilation step (not included).
 
 ## License
 
-Dependencies: OpenCV (Apache 2.0), NumPy (BSD), libdmtx / pylibdmtx (BSD), zxing-cpp (Apache 2.0).
+Add your preferred license. Dependencies: OpenCV (Apache 2.0), NumPy (BSD), libdmtx/pylibdmtx (BSD), zxing-cpp (Apache 2.0).
