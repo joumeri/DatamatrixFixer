@@ -632,7 +632,7 @@ class Geometry:
                                     r = np.rot90(v, k)
                                     dp, dmn, lmn = self.dprime(r)
                                     if best is None or dp > best["dp"]:
-                                        best = dict(dp=dp, v=r, dm=dmn, lm=lmn)
+                                        best = dict(dp=dp, v=r, dm=dmn, lm=lmn, k=k, inv=inv)
         return best
 
     def _blurs(self, gray, quads):
@@ -653,7 +653,8 @@ class Geometry:
             return None
         thr = (best["dm"] + best["lm"]) / 2
         half = (best["lm"] - best["dm"]) / 2
-        return dict(dp=best["dp"], e=np.clip((thr - best["v"]) / half, -1, 1))
+        return dict(dp=best["dp"], e=np.clip((thr - best["v"]) / half, -1, 1),
+                    k=best["k"], inv=best["inv"])
 
 
 _GEO = {}
@@ -680,6 +681,380 @@ def auto_geometries(gray, top=3):
         scores.append((geo.quick_score(gray, quads), geo))
     scores.sort(key=lambda t: -t[0])
     return [g for s, g in scores[:top] if s > 0.5]
+
+
+# ============================================================================
+# Oma ECC200-enkooderi (ASCII-tila) ja mallisovitus (template fit)
+# ============================================================================
+def _gen_poly(nec):
+    g = [1]
+    for i in range(1, nec + 1):
+        g = pmul(g, [EXP[i], 1])
+    return g
+
+
+def rs_encode(data, nec):
+    g = _gen_poly(nec)
+    rem = [0] * nec
+    for c in data:
+        f = c ^ rem[0]
+        rem = rem[1:] + [0]
+        if f:
+            for j in range(nec):
+                rem[j] ^= gmul(f, g[nec - 1 - j])
+    return rem
+
+
+def ascii_encode(text):
+    out, i = [], 0
+    while i < len(text):
+        c = text[i]
+        if c.isdigit() and i + 1 < len(text) and text[i + 1].isdigit():
+            out.append(130 + int(text[i:i + 2]))
+            i += 2
+        else:
+            o = ord(c)
+            if o > 127:
+                out += [235, o - 127]
+            else:
+                out.append(o + 1)
+            i += 1
+    return out
+
+
+def _pad_to(cw, n):
+    if len(cw) > n:
+        return None
+    cw = list(cw)
+    if len(cw) < n:
+        cw.append(129)
+        while len(cw) < n:
+            r = ((149 * (len(cw) + 1)) % 253) + 1
+            t = 129 + r
+            cw.append(t - 254 if t > 254 else t)
+    return cw
+
+
+def encode_symbol(text, rows, cols):
+    """ASCII-enkoodaus -> moduulimatriisi kanonisessa asennossa (1 = tumma), tai None."""
+    if (rows, cols) not in SYMBOLS:
+        return None
+    try:
+        raw = ascii_encode(text)
+    except Exception:
+        return None
+    vr, hc, nd, ne, nb = SYMBOLS[(rows, cols)]
+    cw = _pad_to(raw, nd)
+    if cw is None:
+        return None
+    nec = ne // nb
+    full = [0] * (nd + ne)
+    for b in range(nb):
+        di = list(range(b, nd, nb))
+        ei = list(range(nd + b, nd + ne, nb))
+        blk = [cw[i] for i in di]
+        ecc = rs_encode(blk, nec)
+        for j, i in enumerate(di):
+            full[i] = blk[j]
+        for j, i in enumerate(ei):
+            full[i] = ecc[j]
+    rh, rw = rows // vr - 2, cols // hc - 2
+    core = np.zeros((vr * rh, hc * rw), np.uint8)
+    pos, ncw = placement(*core.shape)
+    placed = np.zeros(core.shape, bool)
+    for c in range(1, ncw + 1):
+        for b in range(1, 9):
+            r, cc = pos[(c, b)]
+            core[r, cc] = (full[c - 1] >> (8 - b)) & 1
+            placed[r, cc] = True
+    if not placed[-1, -1]:
+        core[-1, -1] = 1
+        core[-2, -2] = 1
+    S = np.zeros((rows, cols), np.uint8)
+    for i in range(vr):
+        for j in range(hc):
+            r0, c0 = i * (rh + 2), j * (rw + 2)
+            S[r0 + 1:r0 + 1 + rh, c0 + 1:c0 + 1 + rw] = \
+                core[i * rh:(i + 1) * rh, j * rw:(j + 1) * rw]
+            S[r0:r0 + rh + 2, c0] = 1
+            S[r0 + rh + 1, c0:c0 + rw + 2] = 1
+            for c in range(rw + 2):
+                S[r0, c0 + c] = 1 if c % 2 == 0 else 0
+            for r in range(rh + 2):
+                S[r0 + r, c0 + rw + 1] = 1 if (rh + 1 - r) % 2 == 0 else 0
+    return S
+
+
+FT = 8          # mallin pikseliä per moduuli
+
+
+def _kron(M):
+    return np.kron(M.astype(np.float32), np.ones((FT, FT), np.float32))
+
+
+def _render(S_img, blur):
+    return cv2.GaussianBlur(_kron(S_img), (0, 0), blur)
+
+
+def _ncc(a, b, w):
+    x = a[w]
+    y = b[w]
+    x = x - x.mean()
+    y = y - y.mean()
+    return float((x * y).sum() / (np.sqrt((x * x).sum() * (y * y).sum()) + 1e-9))
+
+
+class FitMatcher:
+    """Sovittaa ehdokkaan moduulimallin suoraan (matalaresoluutioiseen, sumeaan) kuvaan.
+    Optimoi perspektiivimuunnoksen (4 kulmaa) kuvan ja mallin välisen korrelaation mukaan.
+    Kestää epätarkan ruudukon, jossa suora näytteistys epäonnistuu. Puolet mallista voi
+    olla vioittunutta: vertailu tehdään myös maskeilla, jotka jättävät pois reunakaistan."""
+
+    def __init__(self, geo, serials, schemes):
+        from scipy.optimize import minimize   # noqa: F401  (tarkistus)
+        self.geo = geo
+        self.items = []               # (teksti, skeema, matriisi kanonisessa asennossa)
+        seen = set()
+        for s in serials:
+            mats = []
+            S = encode_symbol(s, geo.rows, geo.cols)
+            if S is not None:
+                mats.append(("Ascii", S))
+            if HAVE_DMTX:
+                for sch in schemes:
+                    if sch == "Ascii":
+                        continue
+                    m = geo.module_matrix(s, sch)
+                    if m is not None:
+                        mats.append((sch, m.astype(np.uint8)))
+            for sch, M in mats:
+                key = (s, M.tobytes())
+                if key not in seen:
+                    seen.add(key)
+                    self.items.append((s, sch, M))
+        self.stack = np.stack([m for _, _, m in self.items]) if self.items else None
+
+    # --- apufunktiot ---
+    @staticmethod
+    def _orient(M, k):
+        return np.rot90(M, -k)         # kanoninen -> kuvan asento (k kiertoa myötäpäivään)
+
+    def _channels(self, bgr):
+        ch = [("R", bgr[:, :, 2]), ("G", bgr[:, :, 1]), ("B", bgr[:, :, 0]),
+              ("gray", cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))]
+        flat = bgr.reshape(-1, 3).astype(np.float32)
+        flat -= flat.mean(axis=0)
+        try:
+            _, vecs = cv2.PCACompute(flat, mean=None, maxComponents=1)
+            p = (flat @ vecs[0]).reshape(bgr.shape[:2])
+            ch.append(("PCA", (p - p.min()).astype(np.float32)))
+        except Exception:
+            pass
+        return [(n, c.astype(np.float32)) for n, c in ch]
+
+    def _warp(self, chan, quad0, p, th, tw):
+        q = quad0 + np.float32(p).reshape(4, 2)
+        dst = np.float32([[0, 0], [tw, 0], [tw, th], [0, th]])
+        return cv2.warpPerspective(chan, cv2.getPerspectiveTransform(q, dst), (tw, th),
+                                   flags=cv2.INTER_LINEAR)
+
+    def _fit(self, chan, quad0, tmpl, wmask, x0s):
+        from scipy.optimize import minimize
+        th, tw = tmpl.shape
+        best = None
+        for x0 in x0s:
+            r = minimize(lambda p: -_ncc(tmpl, self._warp(chan, quad0, p, th, tw), wmask),
+                         x0, method="Powell", options=dict(xtol=0.05, ftol=1e-4, maxiter=3000))
+            if best is None or r.fun < best.fun:
+                best = r
+        return best
+
+    def _strip_masks(self, k, strip=3):
+        """Moduulimaskit kuvan asennossa: kaikki + yksi reunakaista pois kerrallaan."""
+        rows, cols = (self.geo.rows, self.geo.cols) if k % 2 == 0 else (self.geo.cols, self.geo.rows)
+        full = np.ones((rows, cols), bool)
+        out = {"kaikki": full}
+        for name, sl in (("ei oikeaa", (slice(None), slice(-strip, None))),
+                         ("ei vasenta", (slice(None), slice(0, strip))),
+                         ("ei ylintä", (slice(0, strip), slice(None))),
+                         ("ei alinta", (slice(-strip, None), slice(None)))):
+            m = full.copy()
+            m[sl] = False
+            out[name] = m
+        return out
+
+    def _edge_orient(self, chan, quad):
+        """Asento neliösymbolille: kaksi vierekkäistä tasaista sivua (L) ja kaksi vuorottelevaa
+        (kello). Palauttaa (k, laatu), k: kanoninen -> kuvan asento np.rot90(M, -k)."""
+        n_ = self.geo.rows
+        Wt = n_ * FT
+        dst = np.float32([[0, 0], [Wt, 0], [Wt, Wt], [0, Wt]])
+        w_ = cv2.warpPerspective(chan, cv2.getPerspectiveTransform(order_corners(quad), dst),
+                                 (Wt, Wt), flags=cv2.INTER_LINEAR)
+        a_, b_ = int(FT * 0.25), int(FT * 0.75)
+        lo, hi = FT, Wt - FT
+        prof = {"top": w_[a_:b_, lo:hi].mean(axis=0),
+                "bottom": w_[Wt - b_:Wt - a_, lo:hi].mean(axis=0),
+                "left": w_[lo:hi, a_:b_].mean(axis=1),
+                "right": w_[lo:hi, Wt - b_:Wt - a_].mean(axis=1)}
+        sd = {k_: float(np.std(v_)) + 1e-6 for k_, v_ in prof.items()}
+        pairs = {("bottom", "left"): 0, ("left", "top"): 1, ("right", "top"): 2,
+                 ("bottom", "right"): 3}
+        best = None
+        for (p1, p2), k_ in pairs.items():
+            others = [x for x in sd if x not in (p1, p2)]
+            ratio = (sd[others[0]] + sd[others[1]]) / (sd[p1] + sd[p2])
+            if best is None or ratio > best[1]:
+                best = (k_, ratio)
+        return best
+
+    def match(self, bgr, blur=None, refine=6):
+        """Palauttaa dict(ranked=[(ncc, teksti, skeema, vaihtoehto)], info, agree) tai None."""
+        if self.stack is None:
+            return None
+        geo = self.geo
+        shared_c = (self.stack == self.stack[0]).all(axis=0)
+        border_c = geo.dm | geo.lm
+        base_c = shared_c | border_c
+        chans = self._channels(bgr)
+        # kanavat kontrastin mukaan (p90-p10); käytetään kahta kontrastisinta
+        chans.sort(key=lambda t: -(np.percentile(t[1], 90) - np.percentile(t[1], 10)))
+        chans = chans[:2]
+        # paikannusehdokkaat usealta kanavalta
+        quads = []
+        for _, ch in chans:
+            g8 = cv2.normalize(ch, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            for q in locate_quads(g8, geo.aspect, max_quads=3):
+                q = order_corners(q)
+                if all(np.linalg.norm(q - o, axis=1).mean() > 2.0 for o in quads):
+                    quads.append(q)
+        if not quads:
+            return None
+        # suunnikasvariantit: yksi kulma kerrallaan korvataan kolmesta muusta lasketulla
+        # (kestää esim. siirtyneen reunakaistan aiheuttaman ulkonevan kulman)
+        extra = []
+        for q in quads:
+            for c in range(4):
+                v = q.copy()
+                v[c] = q[(c + 1) % 4] + q[(c + 3) % 4] - q[(c + 2) % 4]
+                if all(np.linalg.norm(v - o, axis=1).mean() > 2.0 for o in quads + extra):
+                    extra.append(v)
+        quads = quads + extra
+        h, w = bgr.shape[:2]
+        blur = blur if blur is not None else max(1.5, FT * 0.30)
+        # karkea haku: kanava x nelikulmio; asento reunojen tasaisuudesta (L = tasainen,
+        # kello = vuorotteleva), neliösymbolille. Suorakulmaiselle kokeillaan kaikki asennot.
+        proto = self.stack[0].astype(np.float32).copy()
+        proto[~base_c] = 0.5
+        pb = np.full((geo.rows, geo.cols), 0.5, np.float32)
+        pb[geo.dm] = 1.0
+        pb[geo.lm] = 0.0
+        coarse = []
+        for ci, (cn, ch) in enumerate(chans):
+            for qi, q in enumerate(quads):
+                if geo.square:
+                    k, qual = self._edge_orient(ch, q)
+                    ks = (k,)
+                else:
+                    ks, qual = (0, 1, 2, 3), 1.0
+                best_c = (0.0, ks[0])
+                for k in ks:
+                    tb = _render(self._orient(pb, k), blur)
+                    wb = _kron(self._orient(border_c, k)) > 0.5
+                    th_, tw_ = tb.shape
+                    c = _ncc(tb, self._warp(ch, q, np.zeros(8), th_, tw_), wb)
+                    if abs(c) > abs(best_c[0]):
+                        best_c = (c, k)
+                coarse.append((qual * abs(best_c[0]), best_c[0], ci, qi, best_c[1]))
+        coarse.sort(reverse=True)
+        # hienosäätö parhaille (kanava, nelikulmio, asento) -kolmikoille: karkea -> tarkka malli
+        fits = []
+        used_q = set()
+        for _, c0, ci, qi, k in coarse:
+            if (ci, qi) in used_q:
+                continue
+            used_q.add((ci, qi))
+            cn, ch = chans[ci]
+            chan = ch if c0 >= 0 else 255.0 - ch
+            So = self._orient(proto, k)
+            wm = _kron(self._orient(base_c, k)) > 0.5
+            rng = np.random.RandomState(ci * 7 + qi * 3 + k)
+            r1 = self._fit(chan, quads[qi], _render(So, blur * 1.9), wm,
+                           [np.zeros(8), rng.uniform(-2.5, 2.5, 8)])
+            r2 = self._fit(chan, quads[qi], _render(So, blur), wm, [r1.x])
+            fits.append((-r2.fun, r2.x, cn, chan, qi, k))
+            if len(fits) >= 12:
+                break
+        fits.sort(key=lambda t: -t[0])
+
+        def solve(fit):
+            a_ncc, px, cn, chan, qi, k = fit
+            quad0 = quads[qi]
+            masks = self._strip_masks(k)
+            sample_img = self._orient(self.stack[0], k)
+            th, tw = sample_img.shape[0] * FT, sample_img.shape[1] * FT
+            dst = np.float32([[0, 0], [tw, 0], [tw, th], [0, th]])
+            q_fit = quad0 + np.float32(px).reshape(4, 2)
+            W0 = np.linalg.inv(cv2.getPerspectiveTransform(q_fit, dst)).astype(np.float32)
+            tmpls = [_render(self._orient(M, k), blur) for _, _, M in self.items]
+            tmpls_w = [_render(self._orient(M, k), blur * 1.9) for _, _, M in self.items]
+            kmask = {mn: _kron(mm) > 0.5 for mn, mm in masks.items()}
+            zero = np.zeros(8)
+
+            def full_fit(idx, mn, starts):
+                r1 = self._fit(chan, quad0, tmpls_w[idx], kmask[mn], starts)
+                return self._fit(chan, quad0, tmpls[idx], kmask[mn], [r1.x])
+
+            # 1a) halpa esikarsinta: kevyt sovitus (vain tarkka malli) kaikille ehdokkaille
+            cheap = []
+            for idx in range(len(self.items)):
+                r = self._fit(chan, quad0, tmpls[idx], kmask["kaikki"], [px])
+                cheap.append((-r.fun, idx))
+            cheap.sort(reverse=True)
+            # 1b) parhaille täysi kaksivaiheinen sovitus useammasta alkuarvauksesta
+            res_all = []
+            for cc0, idx in cheap[:max(25, refine)]:
+                r = full_fit(idx, "kaikki", [px, zero])
+                res_all.append((max(-r.fun, cc0), idx, r.x))
+            res_all += [(cc0, idx, px) for cc0, idx in cheap[max(25, refine):]]
+            res_all.sort(key=lambda t: -t[0])
+            # 2) parhaille: sovitus myös niin, että yksi reunakaista jätetään pois
+            final = {}
+            for cc, idx, xk in res_all[:refine]:
+                best = (cc, "kaikki", xk)
+                for name in ("ei oikeaa", "ei vasenta", "ei ylintä", "ei alinta"):
+                    r = full_fit(idx, name, [xk])
+                    if -r.fun > best[0]:
+                        best = (-r.fun, name, r.x)
+                final[idx] = best
+            ranked = [(v[0], self.items[i][0], self.items[i][1], v[1]) for i, v in final.items()]
+            rest = [(cc, self.items[i][0], self.items[i][1], "kaikki")
+                    for cc, i, _ in res_all[refine:]]
+            ranked.sort(reverse=True)
+            seen, uniq = set(), []
+            for item in ranked + rest:
+                if item[1] not in seen:
+                    seen.add(item[1])
+                    uniq.append(item)
+            top_idx = max(final, key=lambda i: final[i][0])
+            warped2 = self._warp(chan, quad0, final[top_idx][2], th, tw)
+            Si = self._orient(self.items[top_idx][2], k)
+            mod = warped2.reshape(Si.shape[0], FT, Si.shape[1], FT).mean(axis=(1, 3))
+            thr = (mod[Si == 1].mean() + mod[Si == 0].mean()) / 2
+            agree = ((mod - thr) * (Si.astype(np.float32) - 0.5)) > 0
+            return dict(ranked=uniq, channel=cn, orient=k, ncc_align=a_ncc, agree=agree,
+                        best_mask=final[top_idx][1], top=final[top_idx][0])
+
+        sols, seen_fit = [], set()
+        for fit in fits:
+            key = (fit[2], fit[4], fit[5])
+            if key in seen_fit:
+                continue
+            seen_fit.add(key)
+            sols.append(solve(fit))
+            if len(sols) >= 2:
+                break
+        return max(sols, key=lambda d_: d_["top"])
 
 
 # ============================================================================
@@ -821,8 +1196,8 @@ def final_report(readers, args, serial_set):
         val, info = decide(ranked, args.max_err, args.min_margin) if ranked else (None, "")
         rows.append((rd, own, ranked, val, info))
     if not rows:
-        print("Ei käyttökelpoisia kuvia.")
-        return
+        print("Ei käyttökelpoisia kuvia (laatu alle --dp-min).")
+        return False
     # parhaat ensin: oma dekoodaus onnistui > ehdokas OK > pienin virhe
     rows.sort(key=lambda t: (t[1] is None, (2 * t[1]['errors'] + t[1]['erasures']) if t[1] else 0,
                               t[3] is None, t[2][0][0] if t[2] else 9))
@@ -837,10 +1212,72 @@ def final_report(readers, args, serial_set):
     rd, own, ranked, val, info = rows[0]
     if own:
         print(f"\nTULOS: {own['text']!r}  [koko {rd.geo.name}, oma dekooderi]")
-    elif val is not None:
+        return True
+    if val is not None:
         print(f"\nTULOS: {val!r}  [koko {rd.geo.name}, ehdokasvertailu]  {info}")
-    else:
-        print("\nTULOS: ei varmaa tulosta" + (f"  ({info})" if info else ""))
+        return True
+    print("\nTULOS: ei varmaa tulosta" + (f"  ({info})" if info else ""))
+    return False
+
+
+def run_fit(files, geos, serials, schemes, args):
+    """Mallisovitus: sovittaa jokaisen ehdokkaan suoraan kuviin (pienet/sumeat/vioittuneet)."""
+    if not serials:
+        print("\nMallisovitus vaatii ehdokaslistan (serials.txt).")
+        return False
+    try:
+        import scipy  # noqa: F401
+    except ImportError:
+        print("\nMallisovitus vaatii scipyn: py -m pip install scipy")
+        return False
+    found = False
+    for geo in geos:
+        fm = FitMatcher(geo, serials, schemes)
+        if fm.stack is None:
+            print(f"\nMallisovitus [{geo.name}]: yksikään ehdokas ei mahdu symbolikokoon.")
+            continue
+        print(f"\n=== Mallisovitus, koko {geo.name} ({len(fm.items)} ehdokasta, "
+              f"{len(files)} kuvaa) ===")
+        scores, first = {}, None
+        for fp in files:
+            bgr = cv2.imread(fp, cv2.IMREAD_COLOR)
+            if bgr is None:
+                continue
+            res = fm.match(bgr)
+            if res is None:
+                print(f"{os.path.basename(fp)}: koodia ei löytynyt")
+                continue
+            top = res["ranked"][0]
+            print(f"{os.path.basename(fp)}: kanava {res['channel']}, paras {top[1]!r} "
+                  f"(korrelaatio {top[0]:.3f}, {top[3]})")
+            if first is None:
+                first = res
+            for sc, txt, sch, mn in res["ranked"]:
+                scores.setdefault(txt, []).append(sc)
+        if not scores:
+            continue
+        nmax = max(len(v) for v in scores.values())
+        agg = sorted(((float(np.mean(v)), t) for t, v in scores.items() if len(v) == nmax),
+                     reverse=True)
+        for sc, t in agg[:5]:
+            print(f"  {sc:.3f}  {t!r}")
+        best = agg[0]
+        margin = best[0] - agg[1][0] if len(agg) > 1 else None
+        ok = best[0] >= args.fit_min and (margin is None or margin >= args.fit_margin)
+        mtxt = f", marginaali {margin:.3f}" if margin is not None else " (vain yksi ehdokas)"
+        if ok:
+            print(f"\nTULOS (mallisovitus): {best[1]!r}  [koko {geo.name}]  "
+                  f"korrelaatio {best[0]:.3f}{mtxt}")
+            found = True
+        else:
+            print(f"\nMallisovitus: ei varmaa tulosta. Paras {best[1]!r}, korrelaatio "
+                  f"{best[0]:.3f}{mtxt} (rajat: {args.fit_min} / {args.fit_margin})")
+        if first is not None:
+            print("Yhteensopivuuskartta parhaalle (kuvan asennossa, X = poikkeaa; "
+                  f"vioittunut kaista pois: {first['best_mask']}):")
+            for row in first["agree"]:
+                print("  " + "".join("." if v else "X" for v in row))
+    return found
 
 
 def geometries_for(gray, fixed):
@@ -849,8 +1286,9 @@ def geometries_for(gray, fixed):
     return auto_geometries(gray)
 
 
-def process_images(files, fixed, pool, serial_set, args):
+def process_images(files, fixed, pool, serial_set, args, serials=(), schemes=SCHEMES):
     direct_hits = []
+    geo_dp = {}
     for fp in files:
         name = os.path.basename(fp)
         gray = cv2.imread(fp, cv2.IMREAD_GRAYSCALE)
@@ -874,6 +1312,9 @@ def process_images(files, fixed, pool, serial_set, args):
         if not results:
             print(f"{name}: koodia ei löytynyt")
             continue
+        for g_, r_ in results:
+            old = geo_dp.get(g_.name, (g_, 0.0))
+            geo_dp[g_.name] = (g_, old[1] + r_["dp"])
         usable_res = [(g_, r_) for g_, r_ in results if r_["dp"] >= args.dp_min]
         shown = usable_res if usable_res else [max(results, key=lambda t: t[1]["dp"])]
         for geo, res in shown:
@@ -892,8 +1333,19 @@ def process_images(files, fixed, pool, serial_set, args):
     if direct_hits:
         print(f"\nSuoria dekoodauksia {len(direct_hits)} kpl, yleisin: "
               f"{max(set(direct_hits), key=direct_hits.count)!r}")
+    own_ok = False
     if not args.each:
-        final_report(pool.all(), args, serial_set)
+        own_ok = final_report(pool.all(), args, serial_set)
+    if serials and args.fit != "off" and (args.fit == "on" or not own_ok):
+        if fixed is not None:
+            geos = [geo_for(r, c) for r, c in fixed]
+        else:
+            ranked_geos = sorted(geo_dp.values(), key=lambda t: -t[1])
+            geos = [g_ for g_, _ in ranked_geos[:1]]
+        if geos:
+            run_fit(files, geos, serials, schemes, args)
+        else:
+            print("\nMallisovitus: symbolikokoa ei tunnistettu, anna --size.")
 
 
 def run_camera(fixed, pool, serial_set, args):
@@ -947,6 +1399,10 @@ def main():
     ap.add_argument("--dp-min", type=float, default=1.5, help="kuvan minimilaatu")
     ap.add_argument("--max-err", type=float, default=0.20)
     ap.add_argument("--min-margin", type=float, default=0.03)
+    ap.add_argument("--fit", choices=["auto", "on", "off"], default="auto",
+                    help="mallisovitus (pienet/sumeat kuvat): auto = kun oma dekooderi epäonnistuu")
+    ap.add_argument("--fit-min", type=float, default=0.55, help="mallisovituksen min. korrelaatio")
+    ap.add_argument("--fit-margin", type=float, default=0.08, help="min. marginaali toiseen")
     args = ap.parse_args()
 
     serials = load_serials(args.serials)
@@ -963,7 +1419,7 @@ def main():
             files = sorted(glob.glob(os.path.join(args.images, "*")))
         else:
             files = sorted(glob.glob(args.images))
-        process_images(files, fixed, pool, set(serials), args)
+        process_images(files, fixed, pool, set(serials), args, serials, args.scheme or SCHEMES)
     else:
         ap.error("anna --images tai --camera")
 
